@@ -98,6 +98,48 @@ result() {
     RESULTS["$task"]="$status"
 }
 
+# Gracefully stop running Docker containers (reusable for upgrade/reboot paths).
+# Args:
+#   $1 = reason string (for logs)
+#   $2 = result key name
+stop_docker_gracefully() {
+    local reason="${1:-maintenance}"
+    local result_key="${2:-Docker Containers}"
+
+    if ! command -v docker &>/dev/null; then
+        info "Docker is not installed -- skipping container shutdown"
+        result "$result_key" "-  Docker not installed"
+        return 2
+    fi
+
+    if ! $SUDO docker info &>/dev/null; then
+        info "Docker daemon is not running -- nothing to stop"
+        result "$result_key" "OK  Docker daemon not running"
+        return 0
+    fi
+
+    local running_containers
+    running_containers=$($SUDO docker ps -q)
+    if [[ -z "$running_containers" ]]; then
+        ok "Docker is running, but no containers are currently active"
+        result "$result_key" "OK  No running containers"
+        return 0
+    fi
+
+    local container_count
+    container_count=$(echo "$running_containers" | wc -l)
+    info "Stopping $container_count running Docker container(s) gracefully before ${reason}..."
+    if $SUDO docker stop $running_containers 2>&1 | tee -a "$LOG_FILE"; then
+        ok "All running Docker containers stopped"
+        result "$result_key" "OK  Stopped $container_count container(s)"
+        return 0
+    fi
+
+    warn "Some Docker containers could not be stopped gracefully"
+    result "$result_key" "!!  Failed to stop one or more containers"
+    return 1
+}
+
 # -- Header --------------------------------------------------------------------
 log ""
 log "${BOLD}+======================================================+${RESET}"
@@ -164,39 +206,10 @@ fi
 # =============================================================================
 section "2 . Docker Pre-Update Shutdown"
 
-if ! command -v docker &>/dev/null; then
-    info "Docker is not installed -- skipping container shutdown"
-    result "Docker Containers" "-  Docker not installed"
-else
-    if ! $SUDO docker info &>/dev/null; then
-        info "Docker daemon is not running -- nothing to stop"
-        result "Docker Containers" "OK  Docker daemon not running"
-    else
-        RUNNING_CONTAINERS=$($SUDO docker ps -q)
-        if [[ -z "$RUNNING_CONTAINERS" ]]; then
-            ok "Docker is running, but no containers are currently active"
-            result "Docker Containers" "OK  No running containers"
-        else
-            CONTAINER_COUNT=$(echo "$RUNNING_CONTAINERS" | wc -l)
-            info "Stopping $CONTAINER_COUNT running Docker container(s) gracefully..."
-            if $SUDO docker stop $RUNNING_CONTAINERS 2>&1 | tee -a "$LOG_FILE"; then
-                ok "All running Docker containers stopped"
-                result "Docker Containers" "OK  Stopped $CONTAINER_COUNT container(s)"
-            else
-                warn "Some Docker containers could not be stopped gracefully"
-                result "Docker Containers" "!!  Failed to stop one or more containers"
-            fi
-        fi
-    fi
-fi
-
-# =============================================================================
-#  3. PACKAGE UPDATES
-# =============================================================================
-section "3 . Package Updates"
-
+APT_UPDATE_OK=0
 info "Updating apt package index..."
 if $SUDO apt-get update 2>&1 | tee -a "$LOG_FILE"; then
+    APT_UPDATE_OK=1
     ok "Package index updated"
     result "Package Index" "OK  Updated"
 else
@@ -205,24 +218,53 @@ else
 fi
 
 info "Checking available upgrades..."
-# `apt list --upgradable` outputs the header "Listing..." plus one line per pkg
-UPGRADABLE_RAW=$($SUDO apt list --upgradable 2>/dev/null | tail -n +2 | wc -l)
-info "$UPGRADABLE_RAW package(s) available to upgrade"
+if (( APT_UPDATE_OK )); then
+    UPGRADABLE_LIST=$($SUDO apt list --upgradable 2>/dev/null | tail -n +2 || true)
+    UPGRADABLE_RAW=$(echo "$UPGRADABLE_LIST" | sed '/^\s*$/d' | wc -l)
+    info "$UPGRADABLE_RAW package(s) available to upgrade"
 
-info "Upgrading packages..."
-UPGRADE_OUT=$(DEBIAN_FRONTEND=noninteractive \
-$SUDO apt-get upgrade -y \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold" 2>&1 | tee -a "$LOG_FILE")
+    DOCKER_UPDATES=$(echo "$UPGRADABLE_LIST" | awk -F/ '{print $1}' | grep -Eic '^(docker|containerd|runc|moby)' || true)
+    if (( DOCKER_UPDATES > 0 )); then
+        warn "Detected $DOCKER_UPDATES Docker-related package update(s); stopping containers before upgrade"
+        stop_docker_gracefully "Docker package upgrades" "Docker Pre-Update Stop"
+    else
+        info "No Docker-related package updates detected -- no pre-upgrade container stop needed"
+        result "Docker Pre-Update Stop" "OK  Not required (no Docker package updates)"
+    fi
+else
+    warn "Skipping upgradable-package scan and Docker pre-stop (apt update failed)"
+    UPGRADABLE_LIST=""
+    UPGRADABLE_RAW=0
+    info "Package upgrade list not refreshed -- treating as 0 upgradable packages"
+    result "Docker Pre-Update Stop" "-  Skipped (apt update failed)"
+fi
 
-# Parse the apt summary line: "X upgraded, Y newly installed, Z to remove..."
-UPGRADED=$(echo "$UPGRADE_OUT" | grep -oP '\d+(?= upgraded)' | tail -1)
-NEWLY=$(echo "$UPGRADE_OUT"    | grep -oP '\d+(?= newly installed)' | tail -1)
-UPGRADED=${UPGRADED:-0}
-NEWLY=${NEWLY:-0}
+# =============================================================================
+#  3. PACKAGE UPDATES
+# =============================================================================
+section "3 . Package Updates"
 
-ok "Package upgrade complete -- ${UPGRADED} upgraded, ${NEWLY} newly installed"
-result "Package Upgrades" "OK  ${UPGRADED} upgraded, ${NEWLY} newly installed"
+if (( APT_UPDATE_OK )); then
+    info "Proceeding with package upgrades..."
+
+    info "Upgrading packages..."
+    UPGRADE_OUT=$(DEBIAN_FRONTEND=noninteractive \
+    $SUDO apt-get upgrade -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" 2>&1 | tee -a "$LOG_FILE")
+
+    # Parse the apt summary line: "X upgraded, Y newly installed, Z to remove..."
+    UPGRADED=$(echo "$UPGRADE_OUT" | grep -oP '\d+(?= upgraded)' | tail -1)
+    NEWLY=$(echo "$UPGRADE_OUT"    | grep -oP '\d+(?= newly installed)' | tail -1)
+    UPGRADED=${UPGRADED:-0}
+    NEWLY=${NEWLY:-0}
+
+    ok "Package upgrade complete -- ${UPGRADED} upgraded, ${NEWLY} newly installed"
+    result "Package Upgrades" "OK  ${UPGRADED} upgraded, ${NEWLY} newly installed"
+else
+    warn "Skipping apt-get upgrade because apt-get update failed"
+    result "Package Upgrades" "XX  SKIPPED (apt update failed)"
+fi
 
 # =============================================================================
 #  4. CLEANUP
@@ -295,15 +337,21 @@ section "5 . Security Checks"
 # Failed SSH logins in last 24h
 info "Checking failed SSH login attempts (last 24h)..."
 if $SUDO test -r /var/log/auth.log; then
+    # grep exits 1 when there are no matches; keep pipefail from failing the assignment
     FAILED_SSH=$($SUDO grep "Failed password" /var/log/auth.log 2>/dev/null \
         | awk -v d="$(date --date='24 hours ago' '+%b %e')" \
-        '$0 >= d' | wc -l)
+        '$0 >= d' | wc -l | tr -d '[:space:]') || true
 elif command -v journalctl &>/dev/null; then
     # Newer systems may not have auth.log; use journalctl
+    # grep -c prints 0 and exits 1 when there are no matches -- do not append a second "0"
     FAILED_SSH=$($SUDO journalctl _COMM=sshd --since "24 hours ago" 2>/dev/null \
-        | grep -c "Failed password" || echo "0")
+        | grep -c "Failed password" || true)
 else
     FAILED_SSH="N/A"
+fi
+
+if [[ "$FAILED_SSH" != "N/A" ]]; then
+    FAILED_SSH=${FAILED_SSH:-0}
 fi
 
 if [[ "$FAILED_SSH" == "N/A" ]]; then
@@ -333,12 +381,25 @@ fi
 info "Listening TCP/UDP ports:"
 if command -v ss &>/dev/null; then
     PORTS_OUT=$($SUDO ss -tlnpu 2>/dev/null)
+    PORTS_UNOWNED=$($SUDO ss -H -tlnpu 2>/dev/null | awk 'index($0,"users:(")==0' | wc -l)
 elif command -v netstat &>/dev/null; then
     PORTS_OUT=$($SUDO netstat -tlnpu 2>/dev/null)
+    PORTS_UNOWNED=$($SUDO netstat -tlnpu 2>/dev/null | awk 'NR>2 && ($NF=="-" || $NF=="-/-")' | wc -l)
 else
     PORTS_OUT="(neither ss nor netstat available)"
+    PORTS_UNOWNED=-1
 fi
 echo "$PORTS_OUT" | tee -a "$LOG_FILE"
+if (( PORTS_UNOWNED == -1 )); then
+    result "Listening Ports" "-  ss/netstat unavailable"
+elif (( PORTS_UNOWNED > 0 )); then
+    warn "Found $PORTS_UNOWNED listening port(s) without visible owning process"
+    info "Note: some listeners (e.g. kernel/root-only) may omit process info in ss/netstat — verify if unexpected"
+    result "Listening Ports" "!!  $PORTS_UNOWNED with no visible process"
+else
+    ok "All listening ports have an owning process"
+    result "Listening Ports" "OK  All listeners mapped to a process"
+fi
 
 # UFW firewall
 if command -v ufw &>/dev/null; then
@@ -387,6 +448,7 @@ fi
 # Reboot required?
 if [[ -f /var/run/reboot-required ]]; then
     warn "A system REBOOT is required (kernel or core lib was updated)"
+    stop_docker_gracefully "system reboot" "Docker Pre-Reboot Stop"
     if [[ -f /var/run/reboot-required.pkgs ]]; then
         REBOOT_PKGS=$(cat /var/run/reboot-required.pkgs 2>/dev/null | tr '\n' ', ' | sed 's/, $//')
         warn "Packages triggering reboot: $REBOOT_PKGS"
