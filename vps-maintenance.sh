@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  vps_maintenance.sh -- Monthly Ubuntu VPS Maintenance Script
+#  vps-maintenance.sh -- Monthly Ubuntu VPS Maintenance Script
 #
-#  Usage:  bash vps_maintenance.sh
+#  Usage:  bash vps-maintenance.sh
 #          (will prompt for sudo password once if not run as root)
 #
-#  Or:     sudo bash vps_maintenance.sh
+#  Or:     sudo bash vps-maintenance.sh
 # =============================================================================
 
 # Strict mode -- but we DON'T use 'set -e' here on purpose, because individual
@@ -29,7 +29,7 @@ else
 fi
 
 # -- Config --------------------------------------------------------------------
-LOG_DIR="/var/log/vps_maintenance"
+LOG_DIR="/var/log/vps-maintenance"
 TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
 LOG_FILE="${LOG_DIR}/maintenance_${TIMESTAMP}.log"
 REPORT_FILE="${LOG_DIR}/report_${TIMESTAMP}.txt"
@@ -52,7 +52,7 @@ if [[ $EUID -ne 0 ]]; then
         exit 1
     fi
 
-    echo -e "\033[1m[vps_maintenance]\033[0m This script needs sudo access."
+    echo -e "\033[1m[vps-maintenance]\033[0m This script needs sudo access."
     echo "Please enter your sudo password (will be cached for the rest of the run):"
     if ! sudo -v; then
         echo "ERROR: Failed to obtain sudo privileges. Exiting."
@@ -160,9 +160,40 @@ else
 fi
 
 # =============================================================================
-#  2. PACKAGE UPDATES
+#  2. DOCKER PRE-UPDATE SHUTDOWN
 # =============================================================================
-section "2 . Package Updates"
+section "2 . Docker Pre-Update Shutdown"
+
+if ! command -v docker &>/dev/null; then
+    info "Docker is not installed -- skipping container shutdown"
+    result "Docker Containers" "-  Docker not installed"
+else
+    if ! $SUDO docker info &>/dev/null; then
+        info "Docker daemon is not running -- nothing to stop"
+        result "Docker Containers" "OK  Docker daemon not running"
+    else
+        RUNNING_CONTAINERS=$($SUDO docker ps -q)
+        if [[ -z "$RUNNING_CONTAINERS" ]]; then
+            ok "Docker is running, but no containers are currently active"
+            result "Docker Containers" "OK  No running containers"
+        else
+            CONTAINER_COUNT=$(echo "$RUNNING_CONTAINERS" | wc -l)
+            info "Stopping $CONTAINER_COUNT running Docker container(s) gracefully..."
+            if $SUDO docker stop $RUNNING_CONTAINERS 2>&1 | tee -a "$LOG_FILE"; then
+                ok "All running Docker containers stopped"
+                result "Docker Containers" "OK  Stopped $CONTAINER_COUNT container(s)"
+            else
+                warn "Some Docker containers could not be stopped gracefully"
+                result "Docker Containers" "!!  Failed to stop one or more containers"
+            fi
+        fi
+    fi
+fi
+
+# =============================================================================
+#  3. PACKAGE UPDATES
+# =============================================================================
+section "3 . Package Updates"
 
 info "Updating apt package index..."
 if $SUDO apt-get update 2>&1 | tee -a "$LOG_FILE"; then
@@ -194,9 +225,9 @@ ok "Package upgrade complete -- ${UPGRADED} upgraded, ${NEWLY} newly installed"
 result "Package Upgrades" "OK  ${UPGRADED} upgraded, ${NEWLY} newly installed"
 
 # =============================================================================
-#  3. CLEANUP
+#  4. CLEANUP
 # =============================================================================
-section "3 . Cleanup"
+section "4 . Cleanup"
 
 info "Running autoremove..."
 AUTOREMOVE_OUT=$(DEBIAN_FRONTEND=noninteractive $SUDO apt-get autoremove -y 2>&1)
@@ -257,9 +288,9 @@ ok "/tmp cleaned -- $TMP_COUNT file(s) removed"
 result "Temp Files" "OK  $TMP_COUNT file(s) removed"
 
 # =============================================================================
-#  4. SECURITY CHECKS
+#  5. SECURITY CHECKS
 # =============================================================================
-section "4 . Security Checks"
+section "5 . Security Checks"
 
 # Failed SSH logins in last 24h
 info "Checking failed SSH login attempts (last 24h)..."
@@ -337,9 +368,9 @@ else
 fi
 
 # =============================================================================
-#  5. SERVICES CHECK
+#  6. SERVICES CHECK
 # =============================================================================
-section "5 . Services Check"
+section "6 . Services Check"
 
 info "Checking for failed systemd services..."
 FAILED_SERVICES=$($SUDO systemctl list-units --state=failed --no-legend 2>/dev/null || true)
@@ -367,9 +398,9 @@ else
 fi
 
 # =============================================================================
-#  6. SSL CERTIFICATE CHECK
+#  7. SSL CERTIFICATE CHECK
 # =============================================================================
-section "6 . SSL Certificate Check"
+section "7 . SSL Certificate Check"
 
 CERT_WARN_DAYS=30   # warn if cert expires within this many days
 CERT_ISSUES=0
@@ -446,6 +477,87 @@ else
     result "SSL Certificates" "OK  Certbot not installed"
 fi
 
+# Traefik ACME verification (for setups using Traefik instead of certbot)
+TRAEFIK_CONTAINER=""
+TRAEFIK_ACTIVE=0
+
+if command -v docker &>/dev/null && $SUDO docker info &>/dev/null; then
+    TRAEFIK_CONTAINER=$($SUDO docker ps --format '{{.Names}}' | grep -Ei '(^|[-_])traefik($|[-_])|traefik' | head -n1 || true)
+    if [[ -n "$TRAEFIK_CONTAINER" ]]; then
+        TRAEFIK_ACTIVE=1
+        ok "Traefik Docker container is running: $TRAEFIK_CONTAINER"
+        result "Traefik Container" "OK  Running ($TRAEFIK_CONTAINER)"
+    fi
+fi
+
+# Only evaluate systemd if Traefik was not found in Docker.
+if [[ -z "$TRAEFIK_CONTAINER" ]] && systemctl list-unit-files 2>/dev/null | grep -q '^traefik\.service'; then
+    if systemctl is-active --quiet traefik; then
+        TRAEFIK_ACTIVE=1
+        ok "Traefik systemd service is active"
+        result "Traefik Service" "OK  Active"
+    else
+        warn "Traefik service is installed but not active"
+        result "Traefik Service" "!!  Installed but not active"
+        CERT_ISSUES=$((CERT_ISSUES+1))
+    fi
+fi
+
+if (( TRAEFIK_ACTIVE == 1 )); then
+    TRAEFIK_ACME_FILE=""
+    for CANDIDATE in /etc/traefik/acme.json /var/lib/traefik/acme.json /opt/traefik/acme.json /srv/traefik/acme.json; do
+        if $SUDO test -f "$CANDIDATE"; then
+            TRAEFIK_ACME_FILE="$CANDIDATE"
+            break
+        fi
+    done
+
+    # If Traefik is in Docker, try to discover the host-side acme.json mount path.
+    if [[ -z "$TRAEFIK_ACME_FILE" && -n "$TRAEFIK_CONTAINER" ]]; then
+        TRAEFIK_ACME_FILE=$($SUDO docker inspect "$TRAEFIK_CONTAINER" \
+            --format '{{range .Mounts}}{{println .Source " " .Destination}}{{end}}' \
+            | awk '$1 ~ /acme\.json$/ || $2 ~ /acme\.json$/ {print $1; exit}')
+    fi
+
+    if [[ -n "$TRAEFIK_ACME_FILE" ]] && $SUDO test -r "$TRAEFIK_ACME_FILE"; then
+        ACME_MTIME=$($SUDO stat -c %Y "$TRAEFIK_ACME_FILE" 2>/dev/null || echo "0")
+        NOW_EPOCH=$(date +%s)
+        ACME_AGE_DAYS=$(( (NOW_EPOCH - ACME_MTIME) / 86400 ))
+
+        info "Traefik ACME storage file: $TRAEFIK_ACME_FILE"
+        if (( ACME_AGE_DAYS > 60 )); then
+            warn "Traefik acme.json has not changed for $ACME_AGE_DAYS days (expected renewals around every 60-90 days)"
+            result "Traefik ACME" "!!  acme.json stale (${ACME_AGE_DAYS}d)"
+            CERT_ISSUES=$((CERT_ISSUES+1))
+        else
+            ok "Traefik acme.json updated $ACME_AGE_DAYS day(s) ago"
+            result "Traefik ACME" "OK  acme.json recent (${ACME_AGE_DAYS}d)"
+        fi
+    elif (( TRAEFIK_ACTIVE == 1 )); then
+        warn "Traefik appears active, but acme.json was not found/readable"
+        result "Traefik ACME" "!!  acme.json not found"
+        CERT_ISSUES=$((CERT_ISSUES+1))
+    fi
+
+    # Optional signal: recent renewal messages in logs.
+    RENEW_LOG_HITS=0
+    if [[ -n "$TRAEFIK_CONTAINER" ]]; then
+        RENEW_LOG_HITS=$($SUDO docker logs --since 2160h "$TRAEFIK_CONTAINER" 2>&1 \
+            | grep -Eic 'renew|acme|obtained certificate|lego' || true)
+    elif systemctl is-active --quiet traefik 2>/dev/null; then
+        RENEW_LOG_HITS=$(journalctl -u traefik --since "90 days ago" 2>/dev/null \
+            | grep -Eic 'renew|acme|obtained certificate|lego' || true)
+    fi
+
+    if (( RENEW_LOG_HITS > 0 )); then
+        ok "Traefik logs contain ACME/renewal events in the last 90 days"
+        result "Traefik ACME Logs" "OK  Renewal signals present"
+    else
+        info "No clear Traefik ACME renewal messages found in last 90 days"
+        result "Traefik ACME Logs" "-  No renewal messages found"
+    fi
+fi
+
 # Also check any certs in /etc/ssl/certs or /etc/nginx/ssl if certbot not used
 if [[ $CERT_COUNT -eq 0 ]] && command -v openssl &>/dev/null; then
     for CERT_PATH in /etc/nginx/ssl/*.crt /etc/nginx/ssl/*.pem                      /etc/apache2/ssl/*.crt /etc/ssl/private/*.crt; do
@@ -480,9 +592,9 @@ elif (( CERT_ISSUES == 0 )); then
 fi
 
 # =============================================================================
-#  7. HEALTH SNAPSHOT (after)
+#  8. HEALTH SNAPSHOT (after)
 # =============================================================================
-section "7 . System Health Snapshot (after)"
+section "8 . System Health Snapshot (after)"
 
 info "Disk usage after cleanup:"
 while IFS= read -r line; do
@@ -500,9 +612,9 @@ result "Disk (after)" "$DISK_AFTER"
 result "Memory (after)" "${MEM_AFTER_USED}MB / ${MEM_AFTER_TOTAL}MB (${MEM_AFTER_PCT}%)"
 
 # =============================================================================
-#  8. FINAL REPORT
+#  9. FINAL REPORT
 # =============================================================================
-section "8 . Maintenance Report"
+section "9 . Maintenance Report"
 
 FINISH_TIME=$(date '+%Y-%m-%d %H:%M:%S')
 
@@ -582,7 +694,7 @@ print_report() {
     echo "|  To review this run:                                         |"
     printf "|    cat %-54s |\n" "$LOG_FILE"
     echo "|  To review all past reports:                                 |"
-    echo "|    ls -lt /var/log/vps_maintenance/                          |"
+    echo "|    ls -lt /var/log/vps-maintenance/                          |"
     echo "+==============================================================+"
 }
 
