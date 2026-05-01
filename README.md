@@ -13,7 +13,7 @@ bash vps-maintenance.sh              # sudo password once if not root
 sudo bash vps-maintenance.sh
 ```
 
-Logs and reports go to `/var/log/vps_maintenance/` (`maintenance_<timestamp>.log`, `report_<timestamp>.txt`).
+Logs and reports go to `/var/log/vps-maintenance/` (`maintenance_<timestamp>.log`, `report_<timestamp>.txt`).
 
 ---
 
@@ -34,7 +34,7 @@ Logs and reports go to `/var/log/vps_maintenance/` (`maintenance_<timestamp>.log
 ## Deploy on a server
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/Wired4ncer/vps-maintenance/main/vps-maintenance.sh \
+sudo curl -fsSL https://raw.githubusercontent.com/magicka7/vps-maintenance/main/vps-maintenance.sh \
   -o /usr/local/sbin/vps-maintenance.sh \
   && sudo chmod +x /usr/local/sbin/vps-maintenance.sh
 ```
@@ -45,7 +45,7 @@ Many hosts:
 
 ```bash
 for VPS in user@vps1.example.com user@vps2.example.com; do
-  ssh "$VPS" 'sudo curl -fsSL https://raw.githubusercontent.com/Wired4ncer/vps-maintenance/main/vps-maintenance.sh -o /usr/local/sbin/vps-maintenance.sh && sudo chmod +x /usr/local/sbin/vps-maintenance.sh'
+  ssh "$VPS" 'sudo curl -fsSL https://raw.githubusercontent.com/magicka7/vps-maintenance/main/vps-maintenance.sh -o /usr/local/sbin/vps-maintenance.sh && sudo chmod +x /usr/local/sbin/vps-maintenance.sh'
 done
 ```
 
@@ -58,7 +58,7 @@ sudo crontab -e
 ```
 
 ```
-0 3 1 * * /usr/local/sbin/vps-maintenance.sh --no-color >> /var/log/vps_maintenance/cron.log 2>&1
+0 3 1 * * /usr/local/sbin/vps-maintenance.sh --no-color >> /var/log/vps-maintenance/cron.log 2>&1
 ```
 
 Use root’s crontab so sudo is not required.
