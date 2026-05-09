@@ -51,20 +51,6 @@ done
 
 ---
 
-## Cron (monthly, root)
-
-```bash
-sudo crontab -e
-```
-
-```
-0 3 1 * * /usr/local/sbin/vps-maintenance.sh --no-color >> /var/log/vps-maintenance/cron.log 2>&1
-```
-
-Use root’s crontab so sudo is not required.
-
----
-
 ## Tunables (top of script)
 
 | Variable | Default | Role |

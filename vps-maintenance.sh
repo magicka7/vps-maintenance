@@ -41,6 +41,7 @@ SSH_FAIL_WARN=50            # warn if failed SSH attempts > this in 24h
 # -- Counters & results --------------------------------------------------------
 WARNINGS=0
 ERRORS=0
+APT_UPDATE_OK=0    # set by docker/apt index step; read by package upgrades
 declare -A RESULTS   # task name -> status string
 RESULT_ORDER=()      # preserve insertion order for the report
 
@@ -140,6 +141,82 @@ stop_docker_gracefully() {
     return 1
 }
 
+# Terminal/report helpers (used by task_final_report)
+colorize_status() {
+    local s="$1"
+    if [[ "$s" == OK* ]] || [[ "$s" == "[OK]"* ]]; then
+        printf '%s%s%s' "$GREEN" "$s" "$RESET"
+    elif [[ "$s" == "!!"* ]] || [[ "$s" == "[WARN]"* ]]; then
+        printf '%s%s%s' "$YELLOW" "$s" "$RESET"
+    elif [[ "$s" == XX* ]] || [[ "$s" == "[ERROR]"* ]]; then
+        printf '%s%s%s' "$RED" "$s" "$RESET"
+    else
+        printf '%s' "$s"
+    fi
+}
+
+# print_report: $1="color" for terminal, $1="plain" for log/report files
+print_report() {
+    local mode="${1:-plain}"
+    echo "+==============================================================+"
+    echo "|                   VPS MAINTENANCE REPORT                     |"
+    echo "+==============================================================+"
+    printf "|  Host     : %-48s |\n" "$(hostname -f 2>/dev/null || hostname)"
+    printf "|  Started  : %-48s |\n" "$TIMESTAMP"
+    printf "|  Finished : %-48s |\n" "$FINISH_TIME"
+    printf "|  Kernel   : %-48s |\n" "$(uname -r)"
+    echo "+==============================================================+"
+    echo "|  TASK RESULTS                                                |"
+    echo "+==============================================================+"
+    if [[ ${#RESULT_ORDER[@]} -gt 0 ]]; then
+        for key in "${RESULT_ORDER[@]}"; do
+            local val="${RESULTS[$key]:-?}"
+            if [[ "$mode" == "color" ]]; then
+                local padded
+                padded=$(printf "%-35s" "$val")
+                printf "|  %-22s : %s |\n" "$key" "$(colorize_status "$padded")"
+            else
+                printf "|  %-22s : %-35s |\n" "$key" "$val"
+            fi
+        done
+    else
+        echo "|  (no task results recorded)                                  |"
+    fi
+    echo "+==============================================================+"
+    printf "|  Warnings : %-48s |\n" "$WARNINGS"
+    printf "|  Errors   : %-48s |\n" "$ERRORS"
+    echo "+==============================================================+"
+    local status_text
+    if (( ERRORS > 0 )); then
+        status_text="[ERROR]  COMPLETED WITH ERRORS"
+    elif (( WARNINGS > 0 )); then
+        status_text="[WARN]   COMPLETED WITH WARNINGS"
+    else
+        status_text="[OK]     ALL CLEAR"
+    fi
+    if [[ "$mode" == "color" ]]; then
+        local padded
+        padded=$(printf "%-48s" "$status_text")
+        printf "|  STATUS   : %s |\n" "$(colorize_status "$padded")"
+    else
+        printf "|  STATUS   : %-48s |\n" "$status_text"
+    fi
+    echo "+==============================================================+"
+    printf "|  Log file : %-48s |\n" "$LOG_FILE"
+    printf "|  Report   : %-48s |\n" "$REPORT_FILE"
+    echo "+==============================================================+"
+    echo "|  To review this run:                                         |"
+    printf "|    cat %-54s |\n" "$LOG_FILE"
+    echo "|  To review all past reports:                                 |"
+    echo "|    ls -lt /var/log/vps-maintenance/                          |"
+    echo "+==============================================================+"
+}
+
+# =============================================================================
+#  Task functions -- comment out invocations at bottom of script to skip steps
+# =============================================================================
+
+task_header() {
 # -- Header --------------------------------------------------------------------
 log ""
 log "${BOLD}+======================================================+${RESET}"
@@ -148,7 +225,9 @@ log "${BOLD}+======================================================+${RESET}"
 log "  Host : $(hostname -f 2>/dev/null || hostname)"
 log "  User : $(whoami)"
 log "  Log  : ${LOG_FILE}"
+}
 
+task_system_health_snapshot_before() {
 # =============================================================================
 #  1. SYSTEM HEALTH SNAPSHOT (before)
 # =============================================================================
@@ -200,7 +279,19 @@ if (( DISK_ISSUES == 0 )); then
 else
     result "Disk Usage" "!!  $DISK_ISSUES partition(s) above ${DISK_WARN_PERCENT}%"
 fi
+}
 
+task_docker_shutdown() {
+# -----------------------------------------------------------------------------
+#  Stop all running Docker containers (optional; see run list at bottom).
+#  Independent of apt / Docker package detection in task_docker_pre_update_shutdown.
+# -----------------------------------------------------------------------------
+section "Docker -- graceful container shutdown"
+
+stop_docker_gracefully "maintenance" "Docker Shutdown"
+}
+
+task_docker_pre_update_shutdown() {
 # =============================================================================
 #  2. DOCKER PRE-UPDATE SHUTDOWN
 # =============================================================================
@@ -238,7 +329,9 @@ else
     info "Package upgrade list not refreshed -- treating as 0 upgradable packages"
     result "Docker Pre-Update Stop" "-  Skipped (apt update failed)"
 fi
+}
 
+task_package_updates() {
 # =============================================================================
 #  3. PACKAGE UPDATES
 # =============================================================================
@@ -265,7 +358,9 @@ else
     warn "Skipping apt-get upgrade because apt-get update failed"
     result "Package Upgrades" "XX  SKIPPED (apt update failed)"
 fi
+}
 
+task_cleanup() {
 # =============================================================================
 #  4. CLEANUP
 # =============================================================================
@@ -329,6 +424,9 @@ $SUDO find /tmp -type f -atime +7 -delete 2>/dev/null || true
 ok "/tmp cleaned -- $TMP_COUNT file(s) removed"
 result "Temp Files" "OK  $TMP_COUNT file(s) removed"
 
+}
+
+task_security_checks() {
 # =============================================================================
 #  5. SECURITY CHECKS
 # =============================================================================
@@ -428,6 +526,9 @@ else
     result "Unattended Upgrades" "!!  Not installed"
 fi
 
+}
+
+task_services_check() {
 # =============================================================================
 #  6. SERVICES CHECK
 # =============================================================================
@@ -459,6 +560,9 @@ else
     result "Reboot Required" "OK  No"
 fi
 
+}
+
+task_ssl_certificate_check() {
 # =============================================================================
 #  7. SSL CERTIFICATE CHECK
 # =============================================================================
@@ -653,6 +757,9 @@ elif (( CERT_ISSUES == 0 )); then
     ok "All $CERT_COUNT certificate(s) are healthy"
 fi
 
+}
+
+task_system_health_snapshot_after() {
 # =============================================================================
 #  8. HEALTH SNAPSHOT (after)
 # =============================================================================
@@ -673,6 +780,9 @@ ok "Health snapshot complete"
 result "Disk (after)" "$DISK_AFTER"
 result "Memory (after)" "${MEM_AFTER_USED}MB / ${MEM_AFTER_TOTAL}MB (${MEM_AFTER_PCT}%)"
 
+}
+
+task_final_report() {
 # =============================================================================
 #  9. FINAL REPORT
 # =============================================================================
@@ -681,89 +791,25 @@ section "9 . Maintenance Report"
 FINISH_TIME=$(date '+%Y-%m-%d %H:%M:%S')
 
 # Build and print the report directly (no subshell, so we can't silently fail).
-# Output goes to stdout (terminal), log file, and report file simultaneously.
-
-# Helper: colorize a status string based on its prefix (OK/!!/XX/[ERROR]/[OK])
-# Takes 1 arg: the string. Returns the same string wrapped in ANSI color codes.
-colorize_status() {
-    local s="$1"
-    # No -e needed because color vars use $'...' which contains real escape chars
-    if [[ "$s" == OK* ]] || [[ "$s" == "[OK]"* ]]; then
-        printf '%s%s%s' "$GREEN" "$s" "$RESET"
-    elif [[ "$s" == "!!"* ]] || [[ "$s" == "[WARN]"* ]]; then
-        printf '%s%s%s' "$YELLOW" "$s" "$RESET"
-    elif [[ "$s" == XX* ]] || [[ "$s" == "[ERROR]"* ]]; then
-        printf '%s%s%s' "$RED" "$s" "$RESET"
-    else
-        printf '%s' "$s"
-    fi
-}
-
-# print_report has two modes:
-#   $1="color"  -> colorize status text for terminal
-#   $1="plain"  -> no colors, for the log/report files
-print_report() {
-    local mode="${1:-plain}"
-    echo "+==============================================================+"
-    echo "|                   VPS MAINTENANCE REPORT                     |"
-    echo "+==============================================================+"
-    printf "|  Host     : %-48s |\n" "$(hostname -f 2>/dev/null || hostname)"
-    printf "|  Started  : %-48s |\n" "$TIMESTAMP"
-    printf "|  Finished : %-48s |\n" "$FINISH_TIME"
-    printf "|  Kernel   : %-48s |\n" "$(uname -r)"
-    echo "+==============================================================+"
-    echo "|  TASK RESULTS                                                |"
-    echo "+==============================================================+"
-    if [[ ${#RESULT_ORDER[@]} -gt 0 ]]; then
-        for key in "${RESULT_ORDER[@]}"; do
-            local val="${RESULTS[$key]:-?}"
-            if [[ "$mode" == "color" ]]; then
-                # Print with ANSI codes -- but printf %-35s would count the codes
-                # toward width, so we pad first, then colorize the whole field
-                local padded
-                padded=$(printf "%-35s" "$val")
-                printf "|  %-22s : %s |\n" "$key" "$(colorize_status "$padded")"
-            else
-                printf "|  %-22s : %-35s |\n" "$key" "$val"
-            fi
-        done
-    else
-        echo "|  (no task results recorded)                                  |"
-    fi
-    echo "+==============================================================+"
-    printf "|  Warnings : %-48s |\n" "$WARNINGS"
-    printf "|  Errors   : %-48s |\n" "$ERRORS"
-    echo "+==============================================================+"
-    local status_text
-    if (( ERRORS > 0 )); then
-        status_text="[ERROR]  COMPLETED WITH ERRORS"
-    elif (( WARNINGS > 0 )); then
-        status_text="[WARN]   COMPLETED WITH WARNINGS"
-    else
-        status_text="[OK]     ALL CLEAR"
-    fi
-    if [[ "$mode" == "color" ]]; then
-        local padded
-        padded=$(printf "%-48s" "$status_text")
-        printf "|  STATUS   : %s |\n" "$(colorize_status "$padded")"
-    else
-        printf "|  STATUS   : %-48s |\n" "$status_text"
-    fi
-    echo "+==============================================================+"
-    printf "|  Log file : %-48s |\n" "$LOG_FILE"
-    printf "|  Report   : %-48s |\n" "$REPORT_FILE"
-    echo "+==============================================================+"
-    echo "|  To review this run:                                         |"
-    printf "|    cat %-54s |\n" "$LOG_FILE"
-    echo "|  To review all past reports:                                 |"
-    echo "|    ls -lt /var/log/vps-maintenance/                          |"
-    echo "+==============================================================+"
-}
-
-# Terminal gets color, files get plain text (so log files don't have ANSI junk)
+# Terminal gets color, files get plain text (so log files don't have ANSI junk).
 print_report color
 print_report plain >> "$LOG_FILE"
 print_report plain | $SUDO tee "$REPORT_FILE" > /dev/null
+
+}
+
+# -- Run maintenance tasks (comment out any line below to skip that step) -----
+task_header
+task_system_health_snapshot_before
+# task_docker_shutdown   # uncomment to stop all running containers before apt/upgrades
+task_docker_pre_update_shutdown
+task_package_updates
+task_cleanup
+task_security_checks
+task_services_check
+task_ssl_certificate_check
+task_system_health_snapshot_after
+task_final_report
 
 log ""
 # Restore terminal to a sane state regardless of what happened during the run
